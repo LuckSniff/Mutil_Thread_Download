@@ -1,0 +1,225 @@
+
+import java.awt.List;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.RandomAccessFile;
+import java.io.UnsupportedEncodingException;
+import java.net.HttpURLConnection;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+import javax.xml.stream.events.StartDocument;
+
+import okhttp3.Call;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+//创建txt文件所需要的时间十分短，在创建一个和多个之间的实现相差不大，所以能够满足记录信息的情况下，使用创建多个文件。
+
+public class FileDownload_Future {
+	
+	public static final int  SUCCESS  = 0;
+	public static final int  FAILED   = 1;
+	public static final int  PAUSED   = 2;
+	public static final int  CANCELED = 4;
+
+	private URL downloadUrl = null;
+	private String filePath;
+	private int threadCount = 0;
+	
+	public FileDownload_Future(URL url,String filePath){
+		this.downloadUrl = url;
+		this.filePath = filePath;
+	}
+	
+	public FileDownload_Future(){}	
+		
+	/**
+	 * 多进程下载文件
+	 * @param url    下载资源的url
+	 * @param file   存储路径
+	 * @param file   线程数
+	 * @return
+	 */
+	public ArrayList<Future<String>> multiDownload(URL url,File file,int threadCount){
+		ExecutorService exec = Executors.newCachedThreadPool();
+		ArrayList<Future<String>> results = new ArrayList<Future<String>>();
+		long contentLength;
+		
+		try {
+			contentLength = getContentLength(url.toString());    
+			int blockSize = (int) (contentLength/threadCount);   //每个线程需要下载文件的大小
+			for(int i=0;i<threadCount;i++){
+				int start = i*blockSize;
+				int end = (i+1)*blockSize - 1;
+				if( i == threadCount -1 ) end = (int) (contentLength - 1);     //最后一个线程，下载剩下所有的数据		
+				results.add(exec.submit(new DownloadThread(i, start, end, url, file)));
+			}
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		return results;
+	}
+	
+	/**
+	 * 获取要下载文件的大小
+	 * @param downloadUrl
+	 * @return
+	 * @throws IOException
+	 */
+	public long getContentLength(String downloadUrl) throws IOException{
+		OkHttpClient client = new OkHttpClient();
+		Request request = new Request.Builder().url(downloadUrl).build();
+		Response response =  client.newCall(request).execute();
+		if(response != null && response.isSuccessful()){
+			long contentLength = response.body().contentLength();
+			response.body().close();
+			return contentLength;
+		}
+		return 0;
+	}
+	
+	
+	//希望改进的地方，线程完成某些标志后能有返回值
+	private class DownloadThread implements Callable<String>{
+		private int threadId;
+		private int start;
+		private int end;
+		private int status;
+		private File recordFile = null;
+		private File downloadFile = null;
+		private URL downloadUrl;
+
+		public DownloadThread(int threadId,int start,int end,URL downloadURL,File downloadFile){
+	    	this.threadId = threadId;
+	    	this.start = start;
+	    	this.end = end;
+	    	this.downloadUrl = downloadURL;
+	    	this.downloadFile = downloadFile;
+	    }
+	    
+		
+		//断点后继续下载不需要off，只需要begin
+		/**
+		 * 断点下载
+		 * @param downloadUrl   下载文件的url
+		 * @param begin    		开始下载的位置
+		 * @param end           结束的位置
+		 * @param file          下载到那个文件
+		 * @param fileOff       文件的偏移量，既从什么地方开始存储
+		 * @return              下载状态
+		 */
+		private int breakpointDownload(URL downloadUrl,int begin,int end,File file,long fileOff){
+			RandomAccessFile saveFile = null;
+			InputStream in = null;
+			int responeCode = 0;
+			
+			int currentPosition = 0;        //记录当前的位置，持久化
+			
+			RandomAccessFile randomAccessFile = null; 
+						
+			try{
+				recordFile = new File(threadId+".txt");
+			    if(recordFile.exists()){    //是否是断点
+			    	BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(recordFile)));
+			    	String temp = reader.readLine();
+			    	begin = new Integer(temp);
+			    	fileOff = begin;
+					reader.close();
+			    }
+
+//			    System.out.println("thread " + threadId +  " begin-end: "+ begin +"-" +end);
+				//断点请求下载
+				OkHttpClient client = new OkHttpClient();
+				Request request = new Request.Builder()
+				.addHeader("RANGE", "bytes=" + begin + "-" + end )    //Range 只请求实体的一部分，指定范围  eg. Range: bytes=500-999 
+				.url(downloadUrl)
+				.build();	
+			    Response response = client.newCall(request).execute();
+			    
+			    if(response != null){
+				    responeCode = response.code();
+				    
+				    if (2 != responeCode / 100) {      //请求资源不正确
+				    	response.body().close();
+				    	return FAILED;
+				    }
+				    
+				    randomAccessFile = new RandomAccessFile(recordFile, "rwd");
+				    int total = 0;
+				    
+					//将获取的数据写入到文件中
+					in = response.body().byteStream();
+					saveFile = new RandomAccessFile(file, "rw");
+					saveFile.seek(fileOff);    //跳过已经下载的字节
+					byte[] buf = new byte[1024*10];
+					int len = 0;
+					while( (len = in.read(buf)) != -1 ){
+						saveFile.write(buf,0,len);
+						total += len;
+						currentPosition = start + total;
+						randomAccessFile.seek(0);
+						randomAccessFile.write((""+currentPosition).getBytes()); 
+					}		
+					
+					response.body().close();
+					return SUCCESS;
+			    }
+			    
+			}catch(Exception e){
+				e.printStackTrace();
+			}finally{
+				try {
+					if( in != null){
+						in.close();
+					}
+					if( saveFile != null){
+						saveFile.close();
+					}
+					if( randomAccessFile != null){			
+						randomAccessFile.close();
+					}
+				}catch (IOException e) {
+					e.printStackTrace();
+				}
+			}
+			return FAILED;
+		}
+
+		@Override
+		public String call() throws Exception {
+			status = breakpointDownload(downloadUrl,start,end,downloadFile,start);
+			if(status == SUCCESS){
+				if(recordFile != null){
+					recordFile.delete();
+				}
+				return threadId + " is successed";
+			}
+			return threadId+" is failed";
+		}
+
+	
+	
+	}
+	
+	
+}

@@ -1,0 +1,45 @@
+
+import java.io.File;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLDecoder;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.ListIterator;
+import java.util.concurrent.Future;
+
+//神奇的ArrayLst,由于ListIterator是其内部类，两者有某些元素受两者操控，所以在改变ListIterator时，ArraylList也会变。
+//再次使用ArrayList生成Iterator时，就会有所改变。
+public class test {
+	public static void main(String[] args) {
+		String urlString = "http://down.jjxsw.com/d/file/p/2018/%E5%A4%A7%E9%80%86%E4%B9%8B%E9%97%A8.rar";
+		URL url;
+		try {
+			url = new URL(urlString);
+			String fileName = URLDecoder.decode(urlString.substring(urlString.lastIndexOf("/")+1), "UTF-8");
+			File file = new File(fileName);			
+			FileDownload_Future fileDownload = new FileDownload_Future();
+			ArrayList<Future<String>> results = fileDownload.multiDownload(url, file, 4);
+			while(true){
+				if(!results.isEmpty()){
+					ListIterator<Future<String>> iterator = results.listIterator();
+					while(iterator.hasNext()){
+						Future<String> future = iterator.next();
+						if(future.isDone()){
+							System.out.println(future.get());
+							iterator.remove();
+						}
+					}	
+				}			
+				System.out.println("do anythings");
+				Thread.sleep(400);
+			}
+			
+			
+		} catch (Exception e) {
+			e.printStackTrace();
+		}
+		
+	}
+
+}
